@@ -1,0 +1,36 @@
+name: gate4-stochastic
+
+on:
+  push:
+    paths:
+      - "experiments/gate4_stochastic_structured.py"
+      - "experiments/gate3_blackbox_probe.py"
+      - "kynnys/audit.py"
+      - ".github/workflows/gate4-stochastic.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gate4:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install Kynnys and experiment dependencies
+        run: |
+          python -m pip install -e .
+          python -m pip install scikit-learn scipy
+      - name: Run Gate 4 stochastic structured-output experiment
+        run: python -m experiments.gate4_stochastic_structured --output gate4_result.json
+      - name: Upload Gate 4 receipt
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate4-stochastic-result
+          path: gate4_result.json
+          if-no-files-found: warn
