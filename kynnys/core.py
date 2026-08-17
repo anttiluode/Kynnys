@@ -411,9 +411,18 @@ class Runtime:
         age = max(0.0, now - cached.validated_at)
         p_invalid = self._p_invalid(spec.hazard_rate, age)
         reuse_loss = p_invalid * req.error_cost
-        run_cost = spec.compute_cost
+        run_cost = spec.compute_cost if spec.compute_cost <= req.max_spend else math.inf
         probe_expected = math.inf
-        if req.allow_probe and spec.probe is not None:
+        # max_spend is a hard per-demand bound, so an admitted probe must be
+        # able to finish the failure path (probe + run) without crossing it.
+        # Otherwise a cheaper expected probe could strand a demand even though
+        # direct execution itself was affordable.
+        probe_worst_case = spec.probe_cost + spec.compute_cost
+        if (
+            req.allow_probe
+            and spec.probe is not None
+            and probe_worst_case <= req.max_spend
+        ):
             probe_expected = spec.probe_cost + p_invalid * spec.compute_cost
 
         # No hidden-world uncertainty: exact input identity is enough.
