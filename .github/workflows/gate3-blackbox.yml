@@ -1,0 +1,35 @@
+name: gate3-blackbox
+
+on:
+  push:
+    paths:
+      - "experiments/gate3_blackbox_probe.py"
+      - "kynnys/audit.py"
+      - ".github/workflows/gate3-blackbox.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gate3:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install Kynnys and experiment dependencies
+        run: |
+          python -m pip install -e .
+          python -m pip install scikit-learn
+      - name: Run Gate 3 black-box attribution experiment
+        run: python experiments/gate3_blackbox_probe.py --output gate3_result.json
+      - name: Upload Gate 3 receipt
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate3-blackbox-result
+          path: gate3_result.json
+          if-no-files-found: warn
