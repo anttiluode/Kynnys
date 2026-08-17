@@ -87,6 +87,32 @@ class KynnysCoreTests(unittest.TestCase):
         self.assertEqual(probe_calls, 1)
         self.assertEqual(run_calls, 1)
 
+    def test_probe_cannot_strand_affordable_direct_run_under_max_spend(self):
+        probe_calls = 0
+        run_calls = 0
+
+        def probe(value, call, now):
+            nonlocal probe_calls
+            probe_calls += 1
+            return False
+
+        @gate(compute_cost=12, probe=probe, probe_cost=5, hazard_rate=math.log(2))
+        def work():
+            nonlocal run_calls
+            run_calls += 1
+            return run_calls
+
+        rt = Runtime()
+        rt.demand(work(), now=0.0)
+        # At p=.5 the unconstrained expected costs are probe=11, run=12.
+        # But max_spend=12 cannot cover the probe-fails-then-run path (17),
+        # while direct execution is admissible. The runtime must RUN directly.
+        out = rt.demand(work(), risk(60, max_spend=12), now=1.0)
+        self.assertEqual(out.action, Action.RUN)
+        self.assertEqual(out.cost, 12)
+        self.assertEqual(probe_calls, 0)
+        self.assertEqual(run_calls, 2)
+
     def test_failed_probe_runs_and_charges_both(self):
         def probe(value, call, now):
             return False
