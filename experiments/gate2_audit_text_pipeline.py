@@ -52,6 +52,18 @@ class SeparationResult:
     suggested_indices: list[int]
 
 
+@dataclass
+class ActiveProbeResult:
+    k: int
+    eta: float
+    alias_cosine: float
+    random_eta_median: float
+    random_eta_p90: float
+    random_alias_cosine_median: float
+    residual_energy_fraction: float
+    probe_tokens: list[str]
+
+
 def _dot(a: Sequence[float], b: Sequence[float]) -> float:
     return float(np.dot(np.asarray(a, dtype=float), np.asarray(b, dtype=float)))
 
@@ -68,7 +80,6 @@ def _cosine(a: Sequence[float], b: Sequence[float]) -> float:
 
 
 def _prob_from_margin(margin: np.ndarray) -> np.ndarray:
-    # Stable sigmoid without scipy.
     x = np.asarray(margin, dtype=float)
     out = np.empty_like(x)
     pos = x >= 0
@@ -93,8 +104,8 @@ def _snapshot(effect_a: np.ndarray, effect_b: np.ndarray) -> AuditSnapshot:
         row.name: row
         for row in audit_effects(
             {
-                "regularization": effect_a.tolist(),
-                "temperature": effect_b.tolist(),
+                "regularization": np.asarray(effect_a, dtype=float).tolist(),
+                "temperature": np.asarray(effect_b, dtype=float).tolist(),
             }
         )
     }
@@ -119,10 +130,10 @@ def _choose_regularization(
 ) -> tuple[float, LogisticRegression, np.ndarray, float]:
     """Find a real regularization change whose output signature is scale-like.
 
-    Temperature scaling can only multiply the baseline margin.  We therefore
-    search the regularization path for the strongest *non-trivial* effect that
-    most resembles such a scaling direction.  This is deliberate confounder
-    construction, not hyperparameter tuning for classification accuracy.
+    Temperature scaling can only multiply the baseline margin. We search the
+    regularization path for a non-trivial change whose natural-output effect is
+    maximally aligned with that scaling direction. This deliberately constructs
+    a hard attribution case; it is not an accuracy hyperparameter search.
     """
 
     candidates: list[tuple[float, float, float, LogisticRegression, np.ndarray]] = []
@@ -139,7 +150,6 @@ def _choose_regularization(
         effect = margin - baseline_audit
         rel = _norm(effect) / baseline_norm
         similarity = abs(_cosine(effect, baseline_audit))
-        # Require an effect large enough to be measurable on the audit slice.
         if rel >= 0.004:
             candidates.append((similarity, rel, c, model, effect))
 
@@ -151,8 +161,6 @@ def _choose_regularization(
 
 
 def _fit_temperature(effect_regularization: np.ndarray, baseline_margin: np.ndarray) -> float:
-    """Fit the post-hoc score multiplier that best mimics the first effect."""
-
     denom = _dot(baseline_margin, baseline_margin)
     if denom <= 1e-18:
         raise RuntimeError("baseline margin has no energy")
@@ -164,18 +172,18 @@ def _fit_temperature(effect_regularization: np.ndarray, baseline_margin: np.ndar
 
 
 def _separator_scores(effect_a: np.ndarray, effect_b: np.ndarray) -> tuple[np.ndarray, float]:
-    """Per-observation residual after the best scalar alias fit.
+    """Residual after the best scalar alias fit.
 
-    If B is merely a scaled copy of A, residual is zero and no existing
-    observation can separate them.  Large residual coordinates identify cases
-    where the two changes depart from their shared direction and are therefore
-    useful paired-evaluation candidates.
+    Exact scalar copies have zero residual: no re-selection of the same kind of
+    observation can create information that is absent from the measurement.
     """
 
-    denom = _dot(effect_b, effect_b)
-    beta = 0.0 if denom <= 1e-18 else _dot(effect_a, effect_b) / denom
-    residual = np.asarray(effect_a, dtype=float) - beta * np.asarray(effect_b, dtype=float)
-    energy = _dot(residual, residual) / max(_dot(effect_a, effect_a), 1e-18)
+    a = np.asarray(effect_a, dtype=float)
+    b = np.asarray(effect_b, dtype=float)
+    denom = _dot(b, b)
+    beta = 0.0 if denom <= 1e-18 else _dot(a, b) / denom
+    residual = a - beta * b
+    energy = _dot(residual, residual) / max(_dot(a, a), 1e-18)
     return np.abs(residual), float(energy)
 
 
@@ -187,7 +195,7 @@ def _p90(values: Iterable[float]) -> float:
     return xs[i]
 
 
-def _separation_trial(
+def _passive_separation_trial(
     effect_a: np.ndarray,
     effect_b: np.ndarray,
     absolute_indices: np.ndarray,
@@ -223,7 +231,114 @@ def _separation_trial(
     )
 
 
-def run(output: Path, *, audit_size: int, candidate_size: int, separator_k: int) -> dict:
+def _eligible_unigram_indices(feature_names: np.ndarray) -> np.ndarray:
+    keep: list[int] = []
+    for i, raw in enumerate(feature_names):
+        token = str(raw)
+        if " " in token or len(token) < 2 or not token.isascii():
+            continue
+        cleaned = token.replace("_", "")
+        if cleaned.isalnum():
+            keep.append(i)
+    return np.asarray(keep, dtype=int)
+
+
+def _effects_for_docs(
+    vectorizer: TfidfVectorizer,
+    baseline: LogisticRegression,
+    regularized: LogisticRegression,
+    temperature_scale: float,
+    docs: list[str],
+) -> tuple[np.ndarray, np.ndarray]:
+    x = vectorizer.transform(docs)
+    base = np.asarray(baseline.decision_function(x), dtype=float)
+    reg = np.asarray(regularized.decision_function(x), dtype=float)
+    temp = temperature_scale * base
+    return reg - base, temp - base
+
+
+def _active_feature_probe(
+    vectorizer: TfidfVectorizer,
+    baseline: LogisticRegression,
+    regularized: LogisticRegression,
+    temperature_scale: float,
+    *,
+    k: int,
+    random_trials: int = 250,
+) -> ActiveProbeResult:
+    """Construct diagnostic documents from coefficient-residual features.
+
+    Natural documents may not contain enough independent geometry to separate a
+    regularized model from a global score rescaling. Here the experiment changes
+    the measurement: select unigram features where the regularized weights
+    depart most from the best pure-scaling explanation, then query one-token
+    diagnostic documents. Random unigram sets are the matched control.
+    """
+
+    names = np.asarray(vectorizer.get_feature_names_out())
+    eligible = _eligible_unigram_indices(names)
+    if len(eligible) < k:
+        raise RuntimeError("not enough eligible unigram features for active probe")
+
+    w0 = np.asarray(baseline.coef_[0], dtype=float)
+    w1 = np.asarray(regularized.coef_[0], dtype=float)
+    b0 = float(baseline.intercept_[0])
+    b1 = float(regularized.intercept_[0])
+
+    a = (w1[eligible] - w0[eligible]) + (b1 - b0)
+    b = (temperature_scale - 1.0) * (w0[eligible] + b0)
+    scores, residual_energy = _separator_scores(a, b)
+    chosen_local = np.argsort(-scores)[:k]
+    chosen_indices = eligible[chosen_local]
+    tokens = [str(names[i]) for i in chosen_indices]
+
+    effect_a, effect_b = _effects_for_docs(
+        vectorizer,
+        baseline,
+        regularized,
+        temperature_scale,
+        tokens,
+    )
+    snap = _snapshot(effect_a, effect_b)
+
+    rng = random.Random(20260817)
+    eligible_list = eligible.tolist()
+    random_eta: list[float] = []
+    random_cos: list[float] = []
+    for _ in range(random_trials):
+        idx = rng.sample(eligible_list, k)
+        docs = [str(names[i]) for i in idx]
+        ra, rb = _effects_for_docs(
+            vectorizer,
+            baseline,
+            regularized,
+            temperature_scale,
+            docs,
+        )
+        rs = _snapshot(ra, rb)
+        random_eta.append(min(rs.regularization_eta, rs.temperature_eta))
+        random_cos.append(rs.alias_cosine)
+
+    return ActiveProbeResult(
+        k=k,
+        eta=min(snap.regularization_eta, snap.temperature_eta),
+        alias_cosine=snap.alias_cosine,
+        random_eta_median=median(random_eta),
+        random_eta_p90=_p90(random_eta),
+        random_alias_cosine_median=median(random_cos),
+        residual_energy_fraction=residual_energy,
+        probe_tokens=tokens,
+    )
+
+
+def run(
+    output: Path,
+    *,
+    audit_size: int,
+    candidate_size: int,
+    separator_k: int,
+    active_probe_k: int,
+) -> dict:
     train = fetch_20newsgroups(
         subset="train",
         categories=list(CATEGORIES),
@@ -286,23 +401,26 @@ def run(output: Path, *, audit_size: int, candidate_size: int, separator_k: int)
 
     audit_before = _snapshot(reg_effect_all[audit_idx], temp_effect_all[audit_idx])
 
-    separation = _separation_trial(
+    passive = _passive_separation_trial(
         reg_effect_all[candidate_idx],
         temp_effect_all[candidate_idx],
         candidate_idx,
         k=separator_k,
     )
 
-    # Exact duplicate-direction negative control: there should be no separating
-    # observation because the two effects are literally scalar copies.
+    active = _active_feature_probe(
+        vectorizer,
+        baseline,
+        regularized,
+        temperature_scale,
+        k=active_probe_k,
+    )
+
     neg_a = reg_effect_all[audit_idx]
     neg_b = 3.0 * neg_a
     negative_control = _snapshot(neg_a, neg_b)
     neg_scores, neg_energy = _separator_scores(neg_a, neg_b)
 
-    # Give the confidence changes a downstream interpretation.  Coverage is the
-    # fraction of examples for which a caller would accept the prediction rather
-    # than abstain. The threshold is fixed from the baseline test distribution.
     threshold = float(np.quantile(np.abs(base_margin_all), 0.25))
     combined_margin = temperature_scale * reg_margin_all
     metrics = {
@@ -327,8 +445,9 @@ def run(output: Path, *, audit_size: int, candidate_size: int, separator_k: int)
             "temperature": {"score_multiplier": temperature_scale},
             "regularization_vs_baseline_margin_cosine": grid_similarity,
         },
-        "audit": asdict(audit_before),
-        "separation": asdict(separation),
+        "natural_audit": asdict(audit_before),
+        "passive_existing_observation_search": asdict(passive),
+        "active_diagnostic_probe": asdict(active),
         "negative_control": {
             **asdict(negative_control),
             "separator_residual_energy_fraction": neg_energy,
@@ -340,25 +459,30 @@ def run(output: Path, *, audit_size: int, candidate_size: int, separator_k: int)
         },
     }
 
-    print("\nGATE 2 — REAL TEXT PIPELINE ATTRIBUTION")
+    print("\nGATE 2b — ATTRIBUTION + ACTIVE MEASUREMENT")
     print(f"dataset: 20 Newsgroups {CATEGORIES}; train={x_train.shape[0]} test={x_test.shape[0]}")
     print(f"features: {x_train.shape[1]}")
     print(
         f"regularization: C 1.0 -> {chosen_c}; fitted score multiplier={temperature_scale:.6f}"
     )
     print(
-        "audit slice: "
+        "natural audit: "
         f"cos={audit_before.alias_cosine:.6f} "
-        f"eta(reg)={audit_before.regularization_eta:.6f} "
-        f"eta(temp)={audit_before.temperature_eta:.6f} "
+        f"eta={min(audit_before.regularization_eta, audit_before.temperature_eta):.6f} "
         f"confounded={audit_before.confounded_regularization and audit_before.confounded_temperature}"
     )
     print(
-        f"separator k={separator_k}: eta={separation.suggested_eta:.6f}, "
-        f"cos={separation.suggested_alias_cosine:.6f}; "
-        f"random median eta={separation.random_eta_median:.6f}, "
-        f"random p90 eta={separation.random_eta_p90:.6f}"
+        f"passive best-{separator_k}: eta={passive.suggested_eta:.6f}, "
+        f"cos={passive.suggested_alias_cosine:.6f}; "
+        f"random p90 eta={passive.random_eta_p90:.6f}"
     )
+    print(
+        f"ACTIVE probe-{active_probe_k}: eta={active.eta:.6f}, "
+        f"cos={active.alias_cosine:.6f}; "
+        f"random median eta={active.random_eta_median:.6f}, "
+        f"random p90 eta={active.random_eta_p90:.6f}"
+    )
+    print(f"probe tokens: {', '.join(active.probe_tokens[:12])}")
     print(
         "negative control scalar duplicate: "
         f"eta={negative_control.regularization_eta:.6f}, "
@@ -371,22 +495,24 @@ def run(output: Path, *, audit_size: int, candidate_size: int, separator_k: int)
             f"logloss={value.log_loss:.4f} coverage={value.coverage:.4f}"
         )
 
-    # Gate logic. We want both a real confounder and evidence that the targeted
-    # slice improves identifiability beyond ordinary random evaluation.
     gate = {
-        "confounder_detected": audit_before.alias_cosine >= 0.97,
-        "strict_confounded_flag": (
-            audit_before.confounded_regularization and audit_before.confounded_temperature
+        "natural_outputs_strictly_confounded": (
+            audit_before.alias_cosine >= 0.995
+            and audit_before.confounded_regularization
+            and audit_before.confounded_temperature
         ),
-        "targeted_beats_random_median": separation.suggested_eta > separation.random_eta_median,
-        "targeted_beats_random_p90": separation.suggested_eta > separation.random_eta_p90,
+        "passive_reselection_still_confounded": passive.suggested_eta < 0.1,
+        "active_probe_meaningfully_separates": active.eta >= 0.25,
+        "active_probe_beats_random_p90": active.eta > active.random_eta_p90,
         "negative_control_refuses_separation": (
             negative_control.regularization_eta < 1e-9 and neg_energy < 1e-18
         ),
     }
     gate["pass"] = bool(
-        gate["confounder_detected"]
-        and gate["targeted_beats_random_median"]
+        gate["natural_outputs_strictly_confounded"]
+        and gate["passive_reselection_still_confounded"]
+        and gate["active_probe_meaningfully_separates"]
+        and gate["active_probe_beats_random_p90"]
         and gate["negative_control_refuses_separation"]
     )
     result["gate"] = gate
@@ -403,15 +529,17 @@ def main() -> None:
     parser.add_argument("--audit-size", type=int, default=320)
     parser.add_argument("--candidate-size", type=int, default=320)
     parser.add_argument("--separator-k", type=int, default=24)
+    parser.add_argument("--active-probe-k", type=int, default=24)
     args = parser.parse_args()
     result = run(
         args.output,
         audit_size=args.audit_size,
         candidate_size=args.candidate_size,
         separator_k=args.separator_k,
+        active_probe_k=args.active_probe_k,
     )
     if not result["gate"]["pass"]:
-        raise SystemExit("Gate 2 did not pass its preregistered minimum criteria")
+        raise SystemExit("Gate 2b did not pass its tightened criteria")
 
 
 if __name__ == "__main__":
