@@ -4,6 +4,7 @@ on:
   push:
     paths:
       - "experiments/gate5_evidence_admission.py"
+      - "experiments/gate5_evidence_admission_runner.py"
       - ".github/workflows/gate5-evidence-admission.yml"
   workflow_dispatch:
 
@@ -24,7 +25,7 @@ jobs:
           python -m pip install -e .
           python -m pip install numpy
       - name: Run Gate 5 evidence admission
-        run: python -m experiments.gate5_evidence_admission --output gate5_result.json
+        run: python -m experiments.gate5_evidence_admission_runner --output gate5_result.json
       - name: Upload Gate 5 receipt
         if: always()
         uses: actions/upload-artifact@v4
