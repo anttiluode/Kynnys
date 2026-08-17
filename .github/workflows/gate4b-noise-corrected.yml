@@ -4,6 +4,7 @@ on:
   push:
     paths:
       - "experiments/gate4b_noise_corrected.py"
+      - "experiments/gate4b_noise_corrected_runner.py"
       - "experiments/gate4_stochastic_structured.py"
       - "experiments/gate3_blackbox_probe.py"
       - ".github/workflows/gate4b-noise-corrected.yml"
@@ -26,7 +27,7 @@ jobs:
           python -m pip install -e .
           python -m pip install scikit-learn scipy
       - name: Run Gate 4b noise-corrected experiment
-        run: python -m experiments.gate4b_noise_corrected --output gate4b_result.json
+        run: python -m experiments.gate4b_noise_corrected_runner --output gate4b_result.json
       - name: Upload Gate 4b receipt
         if: always()
         uses: actions/upload-artifact@v4
