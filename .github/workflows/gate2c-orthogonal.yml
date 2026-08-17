@@ -26,7 +26,7 @@ jobs:
           python -m pip install -e .
           python -m pip install scikit-learn
       - name: Run Gate 2c orthogonalized probe experiment
-        run: python experiments/gate2c_orthogonal_probe.py --output gate2c_result.json
+        run: python -m experiments.gate2c_orthogonal_probe --output gate2c_result.json
       - name: Upload Gate 2c receipt
         if: always()
         uses: actions/upload-artifact@v4
