@@ -102,7 +102,7 @@ def _http_json(url: str, token: str | None = None) -> tuple[Any, float, int]:
     return json.loads(body), elapsed_ms, len(body)
 
 
-def _cpu_transform(seed: str, rounds: int = 45000) -> str:
+def _cpu_transform(seed: str, rounds: int = 900000) -> str:
     import hashlib
 
     x = seed.encode("utf-8")
@@ -160,6 +160,15 @@ def live_sources() -> list[LiveSource]:
 
         return LiveSource("hn_top_story", refresh, None)
 
+    def hn_max_item() -> LiveSource:
+        url = "https://hacker-news.firebaseio.com/v0/maxitem.json"
+
+        def refresh() -> tuple[str, float]:
+            data, ms, _ = _http_json(url, None)
+            return str(data), ms
+
+        return LiveSource("hn_max_item", refresh, None)
+
     def pypi_numpy() -> LiveSource:
         url = "https://pypi.org/pypi/numpy/json"
 
@@ -174,6 +183,7 @@ def live_sources() -> list[LiveSource]:
         gh_head("anttiluode/Kynnys", slow=True),
         gh_head("python/cpython"),
         github_global_event(),
+        hn_max_item(),
         hn_top_story(),
         pypi_numpy(),
     ]
